@@ -1,0 +1,5 @@
+1)smontagggio modulo corretamente:
+    possiamo inserire un altro modulo che ci cancella i driver dalla tabella dei driver
+    nella open e nella close inc e dec il mio counter (paramentro di modulo)
+    quando lo smonto prima di farlo guardo in proc il parametro o anche nella cleanup
+    se zero lo smonto

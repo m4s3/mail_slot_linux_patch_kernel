@@ -22,6 +22,9 @@ __attribute__((section("__versions"))) = {
 	{ 0x6bc3fbc0, __VMLINUX_SYMBOL_STR(__unregister_chrdev) },
 	{ 0xf432dd3d, __VMLINUX_SYMBOL_STR(__init_waitqueue_head) },
 	{ 0xd2296fc, __VMLINUX_SYMBOL_STR(__register_chrdev) },
+	{ 0xe15f42bb, __VMLINUX_SYMBOL_STR(_raw_spin_trylock) },
+	{ 0xda3e43d1, __VMLINUX_SYMBOL_STR(_raw_spin_unlock) },
+	{ 0xd52bf1ce, __VMLINUX_SYMBOL_STR(_raw_spin_lock) },
 	{ 0x27e1a049, __VMLINUX_SYMBOL_STR(printk) },
 	{ 0xbdfb6dbb, __VMLINUX_SYMBOL_STR(__fentry__) },
 };
@@ -32,4 +35,4 @@ __attribute__((section(".modinfo"))) =
 "depends=";
 
 
-MODULE_INFO(srcversion, "63F9AD59A9EA915038F9CBF");
+MODULE_INFO(srcversion, "9E8E5E287BEE705447A2CB6");

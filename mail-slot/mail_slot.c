@@ -26,25 +26,45 @@ MODULE_DESCRIPTION("this module implements a device file driver for linux  fifo 
 #define MAX_MAIL_SLOT_SIZE (1<<20) //1MB of max storage ///UPPER LIMIT
 #define MAX_SEGMENT_SIZE (1<<10) //1KB of max segment size ///UPPER LIMIT
 #define MAX_MINOR_NUM (256)
-#define BLOCKING_MODE (0)
-#define NON_BLOCKING_MODE (1)
-
 #define DEBUG if(1)
 
-atomic_t count ;//this is used to audit how many session  are still open
-module_param(count,long,S_IRUGO|S_IWUSR);
+//WHAT IS TUNABLE
+#define ACTUAL_MAXIMUM_SIZE_CTL 0
+#define ACTUAL_BLOCKING_MODE_CTL 6
+#define ACTUAL_MAXIMUM_SEGMENT_SIZE_CTL 3
+#define PURGE_OPTION_CTL 9
+//ACTUAL_BLOCKING_CTL options
+#define BLOCKING_MODE 0
+#define NON_BLOCKING_MODE 1
+
+//PURGE PURGE_OPTION_CTL options
+#define PURGE 1
+#define NO_PURGE 0
+//GET
+#define GET_MAX_SEGMENT_SIZE 7
+#define GET_FREE_SIZE 8
+
+
+
+
 
 
 static int ms_open(struct inode *, struct file *);
 static int ms_release(struct inode *, struct file *);
 static ssize_t ms_write(struct file *, const char *, size_t, loff_t *);
 static ssize_t ms_read(struct file * , char * , size_t , loff_t * );
+static long ms_ctl (struct file *filp, unsigned int param1, unsigned long param2);
+static void purge(int current_device);
 
 typedef struct segment{
 	int size;
 	struct segment* next;
 	char* payload;
 } segment;
+
+atomic_t count ;//this is used to audit how many session  are still open
+module_param(count,long,S_IRUGO|S_IWUSR);
+
 
 static int Major; /* Major number assigned to mail slot device driver */
 static segment * head[MAX_MINOR_NUM];
@@ -55,6 +75,7 @@ static int used[MAX_MINOR_NUM];
 static int actual_maximum_size[MAX_MINOR_NUM];
 static int actual_maximum_segment_size[MAX_MINOR_NUM];
 static int blk_mode[MAX_MINOR_NUM];
+static int actual_purge_option[MAX_MINOR_NUM];
 
 
 /* auxiliary stuff */
@@ -62,6 +83,100 @@ static int blk_mode[MAX_MINOR_NUM];
 
 
 /* the actual driver */
+
+//IOCTL
+static long ms_ctl (struct file *filp, unsigned int cmd, unsigned long arg){
+
+	DEBUG
+        printk("%s : ioctl. cmd is %d arg is %ld\n",MODNAME,cmd,arg);
+
+	int current_device = CURRENT_DEVICE;
+    int to_ret;
+
+	if(blk_mode[current_device]==NON_BLOCKING_MODE && (spin_trylock(&lock[current_device]))==0){
+		DEBUG
+            printk("%s : some process is using the device file  with minor %d   and it is in non blocking mode\n",MODNAME,current_device);
+		return -1;
+    }
+
+	else if (blk_mode[current_device]==BLOCKING_MODE)
+		spin_lock(&lock[CURRENT_DEVICE]);
+
+	//se sono qui è perchè o sono asincrono o perchè sono bloccante  e ho passato il lock
+	switch(cmd){
+
+		case ACTUAL_BLOCKING_MODE_CTL: //BLOCKING OR NON BLOCKING
+            DEBUG
+                printk("%s: modifying the block/noblock configuration\n",MODNAME);
+            blk_mode[current_device] = arg;
+            spin_unlock(&lock[current_device]);
+			break;
+
+		case ACTUAL_MAXIMUM_SIZE_CTL:
+            DEBUG
+                printk("%s: modifying the maximum size\n",MODNAME);
+			if(arg > 0 && arg<=MAX_MAIL_SLOT_SIZE){ ///absolute upper limit
+				actual_maximum_size[current_device] = arg;
+                if(actual_purge_option[current_device]==PURGE){
+					//vedere se funziona bene restringendo
+                    purge(current_device);
+                    ///L'UNLOCK QUI LO FA PURGE
+                }
+                else
+                    spin_unlock(&lock[current_device]);
+                DEBUG
+                    printk("%s : ACTUAL_MAXIMUM_SIZE is %d\n",MODNAME,actual_maximum_size[current_device]);
+            }
+			else{
+				spin_unlock(&lock[current_device]);
+				return -EINVAL;
+			}
+			break;
+
+		case ACTUAL_MAXIMUM_SEGMENT_SIZE_CTL:
+			printk("%s: modifying the maximum segment size\n",MODNAME);
+			if(arg<=MAX_SEGMENT_SIZE){ ///absoloute upper limit
+				actual_maximum_segment_size[current_device] = arg;
+				//anche qui ... se era pieno e ora restringo poi quando leggo tutto ok vedere??
+                spin_unlock(&lock[current_device]);
+                DEBUG
+                    printk("%s : ACTUAL_MAXIMUM_SEGMENT_SIZE is %d\n",MODNAME,actual_maximum_segment_size[current_device]);
+            }
+			else{
+				spin_unlock(&lock[current_device]);
+				return -EINVAL;
+			}
+			break;
+
+		case GET_MAX_SEGMENT_SIZE:
+            DEBUG
+                printk("%s: getting the max segment size\n",    MODNAME);
+            to_ret = actual_maximum_segment_size[current_device];
+			spin_unlock(&lock[current_device]);
+			return to_ret;
+		case GET_FREE_SIZE:
+            DEBUG
+                printk("%s: getting the free size\n",MODNAME);
+            to_ret = actual_maximum_size[current_device] - used[current_device];
+			spin_unlock(&lock[current_device]);
+			return to_ret;
+        case PURGE_OPTION_CTL:
+            DEBUG
+                printk("%s: actual purge cmd\n",MODNAME);
+            actual_purge_option[current_device] = arg;
+            if(actual_purge_option[current_device]==PURGE) //magari avevo sforato e l'opzione era NO_PURGE.. ora PURGE!
+                purge(current_device); ///L'unlock qui lo fa purge
+            else
+                spin_unlock(&lock[current_device]);
+            break;
+           //implementare il reset delle option
+		default:
+			printk("%s : DEFAULT\n",MODNAME);
+			spin_unlock(&lock[current_device]);
+			return -ENOTTY;
+	}
+	return 0;
+}
 
 
 static int ms_open(struct inode *inode, struct file *filp){
@@ -113,12 +228,17 @@ static ssize_t ms_read(struct file * filp , char * buff , size_t  len , loff_t *
 }
 
 
+static void purge(int current_device){
+}
+
+
 
 static struct file_operations fops = {
   .write = ms_write,
   .open =  ms_open,
   .release = ms_release,
-  .read = ms_read
+  .read = ms_read,
+  .unlocked_ioctl = ms_ctl
 };
 
 

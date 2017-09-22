@@ -24,7 +24,7 @@ MODULE_DESCRIPTION("this module implements a device file driver for linux  fifo 
 
 #define CURRENT_DEVICE MINOR(filp->f_dentry->d_inode->i_rdev)
 #define MAX_MAIL_SLOT_SIZE (1<<20) //1MB of max storage ///UPPER LIMIT
-#define MAX_SEGMENT_SIZE (1<<10) //1KB of max segment size (both for pkt and stream) ///UPPER LIMIT
+#define MAX_SEGMENT_SIZE (1<<10) //1KB of max segment size ///UPPER LIMIT
 #define MAX_MINOR_NUM (256)
 #define BLOCKING_MODE (0)
 #define NON_BLOCKING_MODE (1)

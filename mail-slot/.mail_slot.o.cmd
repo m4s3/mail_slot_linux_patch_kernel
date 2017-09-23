@@ -743,6 +743,18 @@ deps_/home/biar/Desktop/aosv_project/mail-slot/mail_slot.o := \
     $(wildcard include/config/associative/array.h) \
   include/linux/selinux.h \
     $(wildcard include/config/security/selinux.h) \
+  include/linux/slab.h \
+    $(wildcard include/config/slab/debug.h) \
+    $(wildcard include/config/failslab.h) \
+    $(wildcard include/config/slob.h) \
+    $(wildcard include/config/slab.h) \
+    $(wildcard include/config/slub.h) \
+    $(wildcard include/config/debug/slab.h) \
+  include/linux/kmemleak.h \
+    $(wildcard include/config/debug/kmemleak.h) \
+  include/linux/slub_def.h \
+    $(wildcard include/config/slub/stats.h) \
+    $(wildcard include/config/memcg/kmem.h) \
   include/generated/uapi/linux/version.h \
 
 /home/biar/Desktop/aosv_project/mail-slot/mail_slot.o: $(deps_/home/biar/Desktop/aosv_project/mail-slot/mail_slot.o)

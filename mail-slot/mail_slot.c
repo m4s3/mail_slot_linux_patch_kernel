@@ -7,10 +7,12 @@
 #define EXPORT_SYMTAB
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/moduleparam.h>
 #include <linux/init.h>
 #include <linux/fs.h>
 #include <linux/stat.h>
 #include <linux/sched.h>
+#include <linux/slab.h>/* For kmalloc */
 #include <linux/pid.h>/* For pid types */
 #include <linux/version.h>/* For LINUX_VERSION_CODE */
 
@@ -85,13 +87,14 @@ static int actual_purge_option[MAX_MINOR_NUM];
 /* the actual driver */
 
 //IOCTL
-static long ms_ctl (struct file *filp, unsigned int cmd, unsigned long arg){
-
+static long ms_ctl(struct file *filp, unsigned int cmd, unsigned long arg){
+    int current_device,to_ret;
 	DEBUG
         printk("%s : ioctl. cmd is %d arg is %ld\n",MODNAME,cmd,arg);
 
-	int current_device = CURRENT_DEVICE;
-    int to_ret;
+    current_device=CURRENT_DEVICE;
+
+
 
 	if(blk_mode[current_device]==NON_BLOCKING_MODE && (spin_trylock(&lock[current_device]))==0){
 		DEBUG
@@ -138,6 +141,7 @@ static long ms_ctl (struct file *filp, unsigned int cmd, unsigned long arg){
 			if(arg<=MAX_SEGMENT_SIZE){ ///absoloute upper limit
 				actual_maximum_segment_size[current_device] = arg;
 				//anche qui ... se era pieno e ora restringo poi quando leggo tutto ok vedere??
+                //devo traslare tutti i segmenti correnti !! conviene o li rialloco e memcpy e kfree
                 spin_unlock(&lock[current_device]);
                 DEBUG
                     printk("%s : ACTUAL_MAXIMUM_SEGMENT_SIZE is %d\n",MODNAME,actual_maximum_segment_size[current_device]);
@@ -180,16 +184,16 @@ static long ms_ctl (struct file *filp, unsigned int cmd, unsigned long arg){
 
 
 static int ms_open(struct inode *inode, struct file *filp){
-
+    int tmp_minor;
     atomic_inc(&count);//a new session
-    int tmp_minor=CURRENT_DEVICE;
+    tmp_minor=CURRENT_DEVICE;
     DEBUG
         printk("%s: somebody called an open  on mail slot  dev with minor number %d\n",MODNAME,tmp_minor);
 
 
     if (tmp_minor >= MAX_MINOR_NUM || tmp_minor < 0 ){ //check on device's minor number
         DEBUG
-            printk("%s: error: somebody called an open  on mail slot  dev with minor number %d\n",MODNAME,tmp_minor);
+            printk("%s: error => somebody called an open  on mail slot  dev with minor number %d\n",MODNAME,tmp_minor);
         atomic_dec(&count);
         return -1;
     }
@@ -211,11 +215,95 @@ static int ms_release(struct inode *inode, struct file *filp)
 
 
 
- // #define LINE_SIZE 128
 
 static ssize_t ms_write(struct file *filp,const char *buff,size_t len,loff_t *off){
+    int calling_device,res;
+    segment * new;
+    char * tmp; // per non rischiare di andare in sleep in copy from user
     DEBUG
         printk("%s: somebody called a write  on mail slot  dev with minor number %d\n",MODNAME,CURRENT_DEVICE);
+    if(len > MAX_SEGMENT_SIZE){
+        DEBUG
+            printk("%s : Message cancelled. len=%zu, max segment size =%d \n",MODNAME,len,MAX_SEGMENT_SIZE);
+        return -EMSGSIZE;
+    }
+    calling_device = CURRENT_DEVICE;
+    //prealloco memoria qui cosi non sono in lock e non rischio di allungare la cs se per caso andassi in sleep
+    tmp=kmalloc(len,GFP_KERNEL);
+    memset(tmp,0,len);
+    copy_from_user(tmp,buff,len);  //qui posso andare in sleep ma non fa niente non sono in cs
+
+
+
+    new = kmalloc(sizeof(segment),GFP_KERNEL);
+	memset(new,0,sizeof(segment));
+	new->payload = kmalloc(len,GFP_KERNEL);
+	memset(new->payload,0,len);
+
+    spin_lock(&lock[calling_device]);
+
+	///QUESTO DEVE ESSERE FATTO NECESSARIAMENTE GIA IN SEZIONE CRITICA. Le grandezze massime
+	///POTREBBERO VARIARE ED INOLTRE IL BUFFER SI POTREBBE RIEMPIRE..
+
+    //CHECK se il pacchetto è più grande della dimensione max, in questo caso fallisco
+	if(len > actual_maximum_segment_size[calling_device]){
+		printk("%s : Message cancelled. len=%zu, actual_maximum_size=%d \n",MODNAME,len, actual_maximum_segment_size[calling_device]);
+		spin_unlock(&lock[calling_device]);
+        //free fuori dalla sezione critica
+        kfree(new->payload);
+        kfree(new);
+        return -EMSGSIZE;
+	}
+
+    //È OCCUPATO PIÙ DEL DISPONIBILE (MAX SIZE CAMBIATA) oppure non c'è spazio
+    while((actual_maximum_size[calling_device])-used[calling_device] <= 0 || len>(actual_maximum_size[calling_device])-used[calling_device] ){
+        if(blk_mode[calling_device]==NON_BLOCKING_MODE){
+            spin_unlock(&lock[calling_device]);
+            kfree(new->payload);
+            kfree(new);
+            return -EAGAIN;
+        }
+        spin_unlock(&lock[calling_device]);
+        res = wait_event_interruptible(wait_queues[calling_device], len<=(actual_maximum_size[calling_device]-used[calling_device]));
+        if(res!=0){
+            printk("%s:the process with pid %d has been awaked by a signal\n",MODNAME,current->pid);
+            kfree(new->payload);
+            kfree(new);
+            return -ERESTARTSYS;
+        }
+        else
+            printk("%s: res is %d\n",MODNAME,res);
+        spin_lock(&lock[calling_device]);
+    }
+
+	/*ALLOCAZIONE E RESET  //errore sono in lock non posso allocare potrei andare insleep
+	//con kmalloc poiche non ce l ha chiede al buddy e non ce lha
+	new = kmalloc(sizeof(node),0);
+	memset(new,0,sizeof(node));
+	new->payload = kmalloc(len,0);
+	memset(new->payload,0,len);*/
+
+	//COPIARE IL BUFFER NEL NODO
+	//copy_from_user (new->payload,buff,len); //buff potrebbe essere non materializzato oppure empty zero e andrei in sleep
+    memcpy(new->payload,tmp,len);  //è tutta memoria kernel
+	new->size = len;
+	new->next = NULL;
+	if(head[calling_device]==NULL){
+		head[calling_device] = new;
+		tail[calling_device] = new;
+	}
+	else{
+		tail[calling_device]->next = new;
+		tail[calling_device] = new;
+	}
+
+	used[calling_device] += len;
+
+
+	spin_unlock(&lock[calling_device]);
+
+    wake_up(&wait_queues[calling_device]);
+
 
    return len;
 }
@@ -229,6 +317,30 @@ static ssize_t ms_read(struct file * filp , char * buff , size_t  len , loff_t *
 
 
 static void purge(int current_device){
+    segment* dead_list = NULL;
+    segment* last = NULL; //ULTIMA DA CANCELLARE
+    segment* to_die = NULL;
+    int done = 0;
+    while(used[current_device] > actual_maximum_size[current_device]){
+        if(dead_list==NULL)
+            dead_list = head[current_device];
+        last  = head[current_device];
+        used[current_device] -= head[current_device]->size;
+        head[current_device] = head[current_device]->next;
+        if(head[current_device]==NULL)
+            tail[current_device] = NULL;
+    }
+
+    spin_unlock(&lock[current_device]);
+
+    while(dead_list !=NULL && !done){
+        if(dead_list ==last)
+            done=1;
+        to_die = dead_list;
+        dead_list = dead_list->next;
+        kfree(to_die->payload);
+        kfree(to_die);
+    }
 }
 
 

@@ -80,8 +80,6 @@ static int blk_mode[MAX_MINOR_NUM];
 static int actual_purge_option[MAX_MINOR_NUM];
 
 
-/* auxiliary stuff */
-// will i do anything?
 
 
 /* the actual driver */
@@ -250,6 +248,7 @@ static ssize_t ms_write(struct file *filp,const char *buff,size_t len,loff_t *of
 		printk("%s : Message cancelled. len=%zu, actual_maximum_size=%d \n",MODNAME,len, actual_maximum_segment_size[calling_device]);
 		spin_unlock(&lock[calling_device]);
         //free fuori dalla sezione critica
+        kfree(tmp);
         kfree(new->payload);
         kfree(new);
         return -EMSGSIZE;
@@ -259,6 +258,7 @@ static ssize_t ms_write(struct file *filp,const char *buff,size_t len,loff_t *of
     while((actual_maximum_size[calling_device])-used[calling_device] <= 0 || len>(actual_maximum_size[calling_device])-used[calling_device] ){
         if(blk_mode[calling_device]==NON_BLOCKING_MODE){
             spin_unlock(&lock[calling_device]);
+            kfree(tmp);
             kfree(new->payload);
             kfree(new);
             return -EAGAIN;
@@ -267,6 +267,7 @@ static ssize_t ms_write(struct file *filp,const char *buff,size_t len,loff_t *of
         res = wait_event_interruptible(wait_queues[calling_device], len<=(actual_maximum_size[calling_device]-used[calling_device]));
         if(res!=0){
             printk("%s:the process with pid %d has been awaked by a signal\n",MODNAME,current->pid);
+            kfree(tmp);
             kfree(new->payload);
             kfree(new);
             return -ERESTARTSYS;
@@ -302,6 +303,8 @@ static ssize_t ms_write(struct file *filp,const char *buff,size_t len,loff_t *of
 
 	spin_unlock(&lock[calling_device]);
 
+    kfree(tmp);
+
     wake_up(&wait_queues[calling_device]);
 
 
@@ -310,9 +313,83 @@ static ssize_t ms_write(struct file *filp,const char *buff,size_t len,loff_t *of
 
 
 static ssize_t ms_read(struct file * filp , char * buff , size_t  len , loff_t * off){
+    int current_device,res;
+    segment * old_head;
+    char * ker_buf;
+    current_device=CURRENT_DEVICE;
     DEBUG
-        printk("%s: somebody called a read  on mail slot  dev with minor number %d\n",MODNAME,CURRENT_DEVICE);
-    return 0;
+        printk("%s: somebody called a read  on mail slot  dev with minor number %d\n",MODNAME,current_device);
+    if(len > MAX_SEGMENT_SIZE)
+        len=MAX_SEGMENT_SIZE;
+
+
+
+    ker_buf = kmalloc(len,GFP_KERNEL);
+    memset(ker_buf,0,len);
+    DEBUG
+        printk("%s: the read is before the spin lock\n",MODNAME);
+    spin_lock(&lock[current_device]);
+    DEBUG
+        printk("%s: the read is after the spin lock\n",MODNAME);
+
+
+
+
+
+    if(head[current_device]==NULL){
+        if (blk_mode[current_device] == NON_BLOCKING_MODE){
+            spin_unlock(&lock[current_device]);
+            kfree(ker_buf);
+            return -EAGAIN;
+        }
+        else{
+            spin_unlock(&lock[current_device]);
+            printk("%s : the process with pid = %d is going to sleep\n",MODNAME,current->pid);
+            res = wait_event_interruptible(wait_queues[current_device],head[current_device]!=NULL);
+            if(res!=0){
+                printk("%s:the process with pid %d has been awaked by a signal\n",MODNAME,current->pid);
+                kfree(ker_buf);
+                return -ERESTARTSYS;
+            }
+            else{
+                printk("%s: res is %d\n",MODNAME,res);
+                spin_lock(&lock[current_device]);
+            }
+        }
+    }
+        printk("%s : len = %du and size = %du\n",MODNAME,len,head[current_device]->size);
+    //se sono qui è perchè o c'era gia da leggere o ho dormito e ora c'è :)
+    if(len <  head[current_device]->size){
+        DEBUG
+            printk("%s: someone is trying to read an amount of data less than head segment size \n",MODNAME);
+            spin_unlock(&lock[current_device]);
+            kfree(ker_buf);
+            return -EINVAL;
+
+
+    }
+
+    else{
+        len=head[current_device]->size;
+        old_head = head[current_device];
+        memcpy(ker_buf, head[current_device]->payload,len);
+        used[current_device]-=len;
+        if(tail[current_device] == head[current_device])
+            tail[current_device] = NULL;
+        head[current_device] = head[current_device]->next;
+        spin_unlock(&lock[current_device]);
+        wake_up(&wait_queues[current_device]);
+        copy_to_user(buff,ker_buf,len);
+        //spin_unlock(&lock[current_device]);
+        kfree(old_head->payload);
+        kfree(old_head);
+        kfree(ker_buf);
+
+
+    }
+
+    return len;
+
 }
 
 
@@ -367,9 +444,11 @@ int init_module(void)
     DEBUG
         printk(KERN_INFO "Mail slot device registered, it is assigned major number %d\n", Major);
 
+
     for(i=0;i<MAX_MINOR_NUM;i++){
         actual_maximum_segment_size[i]=MAX_SEGMENT_SIZE;
         actual_maximum_size[i]=MAX_MAIL_SLOT_SIZE;
+        actual_purge_option[i]=NO_PURGE;
         blk_mode[i]=BLOCKING_MODE;
         spin_lock_init(&lock[i]);
         init_waitqueue_head(&wait_queues[i]);
@@ -380,7 +459,15 @@ int init_module(void)
 
 void cleanup_module(void)
 {
-
+    int i;
+    for(i=0;i<MAX_MINOR_NUM;i++){
+        while(head[i]!=NULL){
+            segment* to_die=head[i];
+            head[i]=head[i]->next;
+            kfree(to_die->payload);
+            kfree(to_die);
+			}
+	}
 	unregister_chrdev(Major, DEVICE_NAME);
 
 	printk(KERN_INFO "Mail slot  device unregistered, it was assigned major number %d\n", Major);

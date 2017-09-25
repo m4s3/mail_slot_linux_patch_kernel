@@ -5,21 +5,26 @@
 #include <string.h>
 #include <errno.h>
 #include <stdio_ext.h>
-//
+
 int selected;
-#define MAX_SEGMENT_SIZE (1<<10) //1KB of max segment size (both for pkt and stream) //UPPER BOUND
+//#define MODNAME "FIFO MAIL SLOT"
+//#define DEVICE_NAME "mslot"  /* Device file name in /dev/ - not mandatory  */
+
+//#define CURRENT_DEVICE MINOR(filp->f_dentry->d_inode->i_rdev)
+#define MAX_MAIL_SLOT_SIZE (1<<20) //1MB of max storage ///UPPER LIMIT
+#define MAX_SEGMENT_SIZE (1<<10) //1KB of max segment size ///UPPER LIMIT
+#define MAX_MINOR_NUM (256)
+#define DEBUG if(1)
+
 //WHAT IS TUNABLE
 #define ACTUAL_MAXIMUM_SIZE_CTL 0
-#define ACTUAL_MODE_CTL 1
-#define ACTUAL_BLOCKING_CTL 6
+#define ACTUAL_BLOCKING_MODE_CTL 6
 #define ACTUAL_MAXIMUM_SEGMENT_SIZE_CTL 3
 #define PURGE_OPTION_CTL 9
 //ACTUAL_BLOCKING_CTL options
-#define BLOCKING_MODE (unsigned long) 0
-#define NON_BLOCKING_MODE (unsigned long) 1
-//ACTUAL_MODE_CTL options
-#define STREAMING_MODE (unsigned long)0
-#define PACKET_MODE (unsigned long) 1
+#define BLOCKING_MODE 0
+#define NON_BLOCKING_MODE 1
+
 //PURGE PURGE_OPTION_CTL options
 #define PURGE 1
 #define NO_PURGE 0
@@ -44,7 +49,7 @@ void scrivi(){
 
     int res = write(fd, string, stl-1);
     if(res == -1)
-        puts("write: sei in modalita' non blocking e non c'è spazio a sufficienza");
+        puts("write: sei in modalita' non blocking e non c'è spazio a sufficienza o hai tentato di scrivere di più");
     else if (res<stl-1)
         printf("Il tuo messaggio ha superato la MAX SEGMENT SIZE ED È STATO SCARTATO. La MSS è pari a %d\n", res);
 }
@@ -56,7 +61,7 @@ int leggi(){
     int letti = read(fd, read_buf, to_read);
 
     if(letti==-1){
-        puts("read: sei in modalita' non blocking e non ci sono byte a sufficienza nel buffer");
+        puts("read:  o sei in modalita' non blocking o hai chiesto di meno");
         return -1;
     }
 
@@ -119,41 +124,26 @@ int main(int argc, char** argv){
 				break;
 			case 3:
 				puts("Inserisci:\n1 per modificare blocking/nonblocking \
-							\n2 per modificare pkt/streaming\
-							\n3 per modificare la max segment size\
-							\n4 per modificare la max size per il device\
-                            \n5 per modificare PURGE/NO_PURGE");
+							\n2 per modificare la max segment size\
+							\n3 per modificare la max size per il device\
+                            \n4 per modificare PURGE/NO_PURGE");
 				option = leggiIntero();
 				switch(option){
 					case 1:
 							puts("digita 1 per blocking, 2 per non blocking (DEFAULT: BLOCKING)");
 							option = leggiIntero();
 							if(option==1){
-								if(ioctl(fd,ACTUAL_BLOCKING_CTL,BLOCKING_MODE)==-1){
+								if(ioctl(fd,ACTUAL_BLOCKING_MODE_CTL,BLOCKING_MODE)==-1){
 									puts("ioctl: sei in modalità non blocking ed il device è occupato");
 								}
 							}
 							else{
-								if(ioctl(fd,ACTUAL_BLOCKING_CTL,NON_BLOCKING_MODE)==-1){
+								if(ioctl(fd,ACTUAL_BLOCKING_MODE_CTL,NON_BLOCKING_MODE)==-1){
 									puts("ioctl: sei in modalità non blocking ed il device è occupato");
 								}
 							}
 							break;
 					case 2:
-							puts("digita 1 per streaming, 2 per pkt (DEFAULT: STREAMING)");
-							option = leggiIntero();
-							if(option==1){
-								if(ioctl(fd,ACTUAL_MODE_CTL,STREAMING_MODE)==-1){
-									puts("ioctl: sei in modalità non blocking ed il device è occupato");
-								}
-							}
-							else{
-								if(ioctl(fd,ACTUAL_MODE_CTL,PACKET_MODE)==-1){
-									puts("ioctl: sei in modalità non blocking ed il device è occupato");
-								}
-							}
-							break;
-					case 3:
 						puts("Inserisci la nuova max segment size");
 						option = leggiIntero();
                         res = ioctl(fd,ACTUAL_MAXIMUM_SEGMENT_SIZE_CTL,option);
@@ -162,7 +152,7 @@ int main(int argc, char** argv){
                         else if(res==-1)
                             puts("ioctl: sei in modalità non blocking ed il device è occupato");
 						break;
-					case 4:
+					case 3:
 						puts("Inserisci la nuova dimensione massima per il device");
 						option = leggiIntero();
                         res = ioctl(fd,ACTUAL_MAXIMUM_SIZE_CTL,option);
@@ -171,7 +161,7 @@ int main(int argc, char** argv){
                         else if(res==-1)
                             puts("ioctl: sei in modalità non blocking ed il device è occupato");
 						break;
-                    case 5:
+                    case 4:
 						puts("Inserisci 1 per il purge, 0 per il no purge (DEFAULT: NO PURGE)");
 						option = leggiIntero();
 						switch(option){

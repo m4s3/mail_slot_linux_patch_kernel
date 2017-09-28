@@ -755,7 +755,6 @@ deps_/home/biar/Desktop/aosv_project/mail-slot/mail_slot.o := \
   include/linux/slub_def.h \
     $(wildcard include/config/slub/stats.h) \
     $(wildcard include/config/memcg/kmem.h) \
-  include/generated/uapi/linux/version.h \
 
 /home/biar/Desktop/aosv_project/mail-slot/mail_slot.o: $(deps_/home/biar/Desktop/aosv_project/mail-slot/mail_slot.o)
 

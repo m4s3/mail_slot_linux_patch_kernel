@@ -1,10 +1,11 @@
-
 /*
- *  mail slot  dev file driver - you can put or retrieve streams of bytes into a mail slot
+ *  mail slot  dev file driver @1.0 - you can put or retrieve streams of bytes in a fifo mode into a mail slot
  *  preliminary you need to mknod the dev file and assign the major retrived while mounting this module
  */
 
+
 #define EXPORT_SYMTAB
+
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
@@ -12,51 +13,49 @@
 #include <linux/fs.h>
 #include <linux/stat.h>
 #include <linux/sched.h>
-#include <linux/slab.h>/* For kmalloc */
-#include <linux/pid.h>/* For pid types */
-#include <linux/version.h>/* For LINUX_VERSION_CODE */
+#include <linux/slab.h>
+#include <linux/pid.h>
 
+//devi vedere solo gli include che ti servono
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Massimiliano Cestra");
 MODULE_DESCRIPTION("this module implements a device file driver for linux  fifo mail slot");
 
-#define MODNAME "FIFO MAIL SLOT"
+#define MODNAME "FIFO_MAIL_SLOT"
 #define DEVICE_NAME "mslot"  /* Device file name in /dev/ - not mandatory  */
 
-#define CURRENT_DEVICE MINOR(filp->f_dentry->d_inode->i_rdev)
 #define MAX_MAIL_SLOT_SIZE (1<<20) //1MB of max storage ///UPPER LIMIT
 #define MAX_SEGMENT_SIZE (1<<10) //1KB of max segment size ///UPPER LIMIT
 #define MAX_MINOR_NUM (256)
+
 #define DEBUG if(1)
+#define NO (0)
+#define YES (NO+1)
+
+#define CURRENT_DEVICE MINOR(filp->f_dentry->d_inode->i_rdev)
 
 //WHAT IS TUNABLE
+
 #define ACTUAL_MAXIMUM_SIZE_CTL 0
 #define ACTUAL_BLOCKING_MODE_CTL 6
 #define ACTUAL_MAXIMUM_SEGMENT_SIZE_CTL 3
 #define PURGE_OPTION_CTL 9
+
 //ACTUAL_BLOCKING_CTL options
+
 #define BLOCKING_MODE 0
 #define NON_BLOCKING_MODE 1
 
 //PURGE PURGE_OPTION_CTL options
+
 #define PURGE 1
 #define NO_PURGE 0
+
 //GET
+
 #define GET_MAX_SEGMENT_SIZE 7
 #define GET_FREE_SIZE 8
-
-
-
-
-
-
-static int ms_open(struct inode *, struct file *);
-static int ms_release(struct inode *, struct file *);
-static ssize_t ms_write(struct file *, const char *, size_t, loff_t *);
-static ssize_t ms_read(struct file * , char * , size_t , loff_t * );
-static long ms_ctl (struct file *filp, unsigned int param1, unsigned long param2);
-static void purge(int current_device);
 
 typedef struct segment{
 	int size;
@@ -64,51 +63,70 @@ typedef struct segment{
 	char* payload;
 } segment;
 
-atomic_t count ;//this is used to audit how many session  are still open
-module_param(count,long,S_IRUGO|S_IWUSR);
+typedef struct _elem{
+	struct task_struct *task;
+	int pid;
+	int awake;
+    int len;
+	int already_hit;
+	struct _elem * next;
+	struct _elem * prev;
+} elem;
 
+typedef struct _list{
+    elem head;
+    elem tail;
+} list;
 
-static int Major; /* Major number assigned to mail slot device driver */
+static int ms_open(struct inode *, struct file *);
+static int ms_release(struct inode *, struct file *);
+static ssize_t ms_write(struct file *, const char *, size_t, loff_t *);
+static ssize_t ms_read(struct file * , char * , size_t , loff_t * );
+static long ms_ctl (struct file *filp, unsigned int param1, unsigned long param2);
+static void purge(int current_device);
+static void print_q(elem *,elem *);
+static void awake_until(int , elem * , elem *);
+
+static elem my_head = {NULL,-1,-1,-1,-1,NULL,NULL};
+static elem my_tail = {NULL,-1,-1,-1,-1,NULL,NULL};
+static int Major;
 static segment * head[MAX_MINOR_NUM];
 static segment * tail[MAX_MINOR_NUM];
+static list  list_r[MAX_MINOR_NUM];
+static list  list_w[MAX_MINOR_NUM];
 static spinlock_t lock[MAX_MINOR_NUM];
-static wait_queue_head_t wait_queues[MAX_MINOR_NUM];
 static int used[MAX_MINOR_NUM];
 static int actual_maximum_size[MAX_MINOR_NUM];
 static int actual_maximum_segment_size[MAX_MINOR_NUM];
 static int blk_mode[MAX_MINOR_NUM];
 static int actual_purge_option[MAX_MINOR_NUM];
 
-
-
-
 /* the actual driver */
 
 //IOCTL
 static long ms_ctl(struct file *filp, unsigned int cmd, unsigned long arg){
-    int current_device,to_ret;
+    int current_device,to_ret,old_maximum_size;
+
 	DEBUG
         printk("%s : ioctl. cmd is %d arg is %ld\n",MODNAME,cmd,arg);
 
     current_device=CURRENT_DEVICE;
 
-
-
 	if(blk_mode[current_device]==NON_BLOCKING_MODE && (spin_trylock(&lock[current_device]))==0){
 		DEBUG
-            printk("%s : some process is using the device file  with minor %d   and it is in non blocking mode\n",MODNAME,current_device);
+            printk("%s : some process is using the device file  with minor %d   and the process %d is not blocking\n",MODNAME,current_device,current->pid);
 		return -1;
     }
 
 	else if (blk_mode[current_device]==BLOCKING_MODE)
 		spin_lock(&lock[CURRENT_DEVICE]);
 
-	//se sono qui è perchè o sono asincrono o perchè sono bloccante  e ho passato il lock
 	switch(cmd){
 
 		case ACTUAL_BLOCKING_MODE_CTL: //BLOCKING OR NON BLOCKING
             DEBUG
                 printk("%s: modifying the block/noblock configuration\n",MODNAME);
+
             blk_mode[current_device] = arg;
             spin_unlock(&lock[current_device]);
 			break;
@@ -116,30 +134,44 @@ static long ms_ctl(struct file *filp, unsigned int cmd, unsigned long arg){
 		case ACTUAL_MAXIMUM_SIZE_CTL:
             DEBUG
                 printk("%s: modifying the maximum size\n",MODNAME);
-			if(arg > 0 && arg<=MAX_MAIL_SLOT_SIZE){ ///absolute upper limit
+
+			if(arg > 0 && arg <= MAX_MAIL_SLOT_SIZE){
+
+                old_maximum_size=actual_maximum_size[current_device];
 				actual_maximum_size[current_device] = arg;
-                if(actual_purge_option[current_device]==PURGE){
-					//vedere se funziona bene restringendo
-                    purge(current_device);
-                    ///L'UNLOCK QUI LO FA PURGE
+
+                if(arg > old_maximum_size){
+                    awake_until(arg-old_maximum_size,&(list_w[current_device].head),&(list_w[current_device].tail));
                 }
-                else
-                    spin_unlock(&lock[current_device]);
-                DEBUG
-                    printk("%s : ACTUAL_MAXIMUM_SIZE is %d\n",MODNAME,actual_maximum_size[current_device]);
+
+                else if(arg < old_maximum_size){
+
+                    if(actual_purge_option[current_device]==PURGE){
+                        purge(current_device);
+                        break;
+                    }
+                    DEBUG
+                        printk("%s : ACTUAL_MAXIMUM_SIZE is %d\n",MODNAME,actual_maximum_size[current_device]);
+                }
+
+                spin_unlock(&lock[current_device]);
             }
 			else{
+
 				spin_unlock(&lock[current_device]);
 				return -EINVAL;
+
 			}
 			break;
 
 		case ACTUAL_MAXIMUM_SEGMENT_SIZE_CTL:
-			printk("%s: modifying the maximum segment size\n",MODNAME);
-			if(arg<=MAX_SEGMENT_SIZE){ ///absoloute upper limit
+            DEBUG
+                printk("%s: modifying the maximum segment size\n",MODNAME);
+
+			if(arg<=MAX_SEGMENT_SIZE){
+
 				actual_maximum_segment_size[current_device] = arg;
-				//anche qui ... se era pieno e ora restringo poi quando leggo tutto ok vedere??
-                //devo traslare tutti i segmenti correnti !! conviene o li rialloco e memcpy e kfree
+
                 spin_unlock(&lock[current_device]);
                 DEBUG
                     printk("%s : ACTUAL_MAXIMUM_SEGMENT_SIZE is %d\n",MODNAME,actual_maximum_segment_size[current_device]);
@@ -152,26 +184,31 @@ static long ms_ctl(struct file *filp, unsigned int cmd, unsigned long arg){
 
 		case GET_MAX_SEGMENT_SIZE:
             DEBUG
-                printk("%s: getting the max segment size\n",    MODNAME);
+                printk("%s: getting the max segment size\n",MODNAME);
+
             to_ret = actual_maximum_segment_size[current_device];
 			spin_unlock(&lock[current_device]);
 			return to_ret;
+
 		case GET_FREE_SIZE:
             DEBUG
                 printk("%s: getting the free size\n",MODNAME);
+
             to_ret = actual_maximum_size[current_device] - used[current_device];
 			spin_unlock(&lock[current_device]);
 			return to_ret;
+
         case PURGE_OPTION_CTL:
             DEBUG
                 printk("%s: actual purge cmd\n",MODNAME);
-            actual_purge_option[current_device] = arg;
-            if(actual_purge_option[current_device]==PURGE) //magari avevo sforato e l'opzione era NO_PURGE.. ora PURGE!
-                purge(current_device); ///L'unlock qui lo fa purge
+
+            actual_purge_option[current_device] = arg;//maybe the usage memory is greather than actual maximum size but the option was NO_PURGE
+
+            if(actual_purge_option[current_device]==PURGE)
+                purge(current_device); //The unlock is done by purge
             else
                 spin_unlock(&lock[current_device]);
             break;
-           //implementare il reset delle option
 		default:
 			printk("%s : DEFAULT\n",MODNAME);
 			spin_unlock(&lock[current_device]);
@@ -180,58 +217,65 @@ static long ms_ctl(struct file *filp, unsigned int cmd, unsigned long arg){
 	return 0;
 }
 
-
 static int ms_open(struct inode *inode, struct file *filp){
+
     int tmp_minor;
-    atomic_inc(&count);//a new session
     tmp_minor=CURRENT_DEVICE;
+
     DEBUG
         printk("%s: somebody called an open  on mail slot  dev with minor number %d\n",MODNAME,tmp_minor);
 
-
-    if (tmp_minor >= MAX_MINOR_NUM || tmp_minor < 0 ){ //check on device's minor number
+    if (tmp_minor >= MAX_MINOR_NUM || tmp_minor < 0 ){
         DEBUG
             printk("%s: error => somebody called an open  on mail slot  dev with minor number %d\n",MODNAME,tmp_minor);
-        atomic_dec(&count);
         return -1;
     }
-
-   return 0;
+    try_module_get(THIS_MODULE);
+    return 0;
 }
 
 
 static int ms_release(struct inode *inode, struct file *filp)
 {
-    atomic_dec(&count);
     DEBUG
         printk("%s: somebody called a close  on mail slot  dev with minor number %d\n",MODNAME,CURRENT_DEVICE);
-    //device closed by default nop
-   return 0;
+    module_put(THIS_MODULE);
+    return 0;
 
 }
-
-
-
-
 
 static ssize_t ms_write(struct file *filp,const char *buff,size_t len,loff_t *off){
     int calling_device,res;
     segment * new;
-    char * tmp; // per non rischiare di andare in sleep in copy from user
+    char * tmp;
+    volatile elem me;
+	elem *aux;
+	DECLARE_WAIT_QUEUE_HEAD(the_queue);
+
+	me.next = NULL;
+	me.prev = NULL;
+	me.task = current;
+	me.pid  = current->pid;
+	me.awake = NO;
+    me.len=len;
+	me.already_hit = NO;
+
     DEBUG
         printk("%s: somebody called a write  on mail slot  dev with minor number %d\n",MODNAME,CURRENT_DEVICE);
+
     if(len > MAX_SEGMENT_SIZE){
+
         DEBUG
             printk("%s : Message cancelled. len=%zu, max segment size =%d \n",MODNAME,len,MAX_SEGMENT_SIZE);
         return -EMSGSIZE;
+
     }
     calling_device = CURRENT_DEVICE;
-    //prealloco memoria qui cosi non sono in lock e non rischio di allungare la cs se per caso andassi in sleep
+
+    //i'm preallocating memory here because I might go to sleep but i'm not in critical section
     tmp=kmalloc(len,GFP_KERNEL);
     memset(tmp,0,len);
-    copy_from_user(tmp,buff,len);  //qui posso andare in sleep ma non fa niente non sono in cs
-
-
+    copy_from_user(tmp,buff,len);
 
     new = kmalloc(sizeof(segment),GFP_KERNEL);
 	memset(new,0,sizeof(segment));
@@ -240,22 +284,26 @@ static ssize_t ms_write(struct file *filp,const char *buff,size_t len,loff_t *of
 
     spin_lock(&lock[calling_device]);
 
-	///QUESTO DEVE ESSERE FATTO NECESSARIAMENTE GIA IN SEZIONE CRITICA. Le grandezze massime
-	///POTREBBERO VARIARE ED INOLTRE IL BUFFER SI POTREBBE RIEMPIRE..
+    //the follow lines must be done in critical section...size of mail slot or segment could change
 
-    //CHECK se il pacchetto è più grande della dimensione max, in questo caso fallisco
-	if(len > actual_maximum_segment_size[calling_device]){
-		printk("%s : Message cancelled. len=%zu, actual_maximum_size=%d \n",MODNAME,len, actual_maximum_segment_size[calling_device]);
-		spin_unlock(&lock[calling_device]);
-        //free fuori dalla sezione critica
-        kfree(tmp);
-        kfree(new->payload);
-        kfree(new);
-        return -EMSGSIZE;
-	}
+    //full,busy more than maximum(ioctl) || the message is too large for the mail slot actually
 
-    //È OCCUPATO PIÙ DEL DISPONIBILE (MAX SIZE CAMBIATA) oppure non c'è spazio
     while((actual_maximum_size[calling_device])-used[calling_device] <= 0 || len>(actual_maximum_size[calling_device])-used[calling_device] ){
+
+        //this check is done because during the time the ioctl could change the actual size of the segments
+
+        if(len > actual_maximum_segment_size[calling_device]){
+
+            printk("%s : Message cancelled. len=%zu, actual_maximum_size=%d \n",MODNAME,len, actual_maximum_segment_size[calling_device]);
+            spin_unlock(&lock[calling_device]);
+
+            //the operations of free are done out by critical section
+            kfree(tmp);
+            kfree(new->payload);
+            kfree(new);
+            return -EMSGSIZE;
+        }
+
         if(blk_mode[calling_device]==NON_BLOCKING_MODE){
             spin_unlock(&lock[calling_device]);
             kfree(tmp);
@@ -263,8 +311,30 @@ static ssize_t ms_write(struct file *filp,const char *buff,size_t len,loff_t *of
             kfree(new);
             return -EAGAIN;
         }
+
+        //the writer has to put itself in the list's tail
+        aux = &(list_w[calling_device].tail);
+
+        if(aux->prev == NULL){
+            spin_unlock(&lock[calling_device]);
+            printk("%s: malformed sleep-list - service damaged\n",MODNAME);
+            kfree(tmp);
+            kfree(new->payload);
+            kfree(new);
+            return -1;
+        }
+
+        aux->prev->next = &me;
+        me.prev = aux->prev;
+        aux->prev = &me;
+        me.next = aux;
+
+        DEBUG
+            print_q(&(list_w[calling_device].head),&(list_w[calling_device].tail));
+
         spin_unlock(&lock[calling_device]);
-        res = wait_event_interruptible(wait_queues[calling_device], len<=(actual_maximum_size[calling_device]-used[calling_device]));
+        res = wait_event_interruptible(the_queue, len<=(actual_maximum_size[calling_device]-used[calling_device]));
+
         if(res!=0){
             printk("%s:the process with pid %d has been awaked by a signal\n",MODNAME,current->pid);
             kfree(tmp);
@@ -274,21 +344,30 @@ static ssize_t ms_write(struct file *filp,const char *buff,size_t len,loff_t *of
         }
         else
             printk("%s: res is %d\n",MODNAME,res);
+
+        //the writer has to delete itself in the list
         spin_lock(&lock[calling_device]);
+        aux = &(list_w[calling_device].head);
+
+        if(aux == NULL){
+            spin_unlock(&lock[calling_device]);
+            printk("%s: malformed sleep-list upon wakeup - service damaged\n",MODNAME);
+            kfree(tmp);
+            kfree(new->payload);
+            kfree(new);
+            return -1;
+        }
+
+        me.prev->next = me.next;//we know where we are thanks to double linkage
+        me.next->prev = me.prev;
+
     }
 
-	/*ALLOCAZIONE E RESET  //errore sono in lock non posso allocare potrei andare insleep
-	//con kmalloc poiche non ce l ha chiede al buddy e non ce lha
-	new = kmalloc(sizeof(node),0);
-	memset(new,0,sizeof(node));
-	new->payload = kmalloc(len,0);
-	memset(new->payload,0,len);*/
-
-	//COPIARE IL BUFFER NEL NODO
-	//copy_from_user (new->payload,buff,len); //buff potrebbe essere non materializzato oppure empty zero e andrei in sleep
-    memcpy(new->payload,tmp,len);  //è tutta memoria kernel
+    memcpy(new->payload,tmp,len);  //here there is only kernel memory
 	new->size = len;
 	new->next = NULL;
+    //now I have to add a new segment in the mailslot's tail
+
 	if(head[calling_device]==NULL){
 		head[calling_device] = new;
 		tail[calling_device] = new;
@@ -300,72 +379,130 @@ static ssize_t ms_write(struct file *filp,const char *buff,size_t len,loff_t *of
 
 	used[calling_device] += len;
 
+    //now I have to awake a reader
+    aux = &(list_r[calling_device].head);
 
-	spin_unlock(&lock[calling_device]);
+	if(aux == NULL){
 
+		spin_unlock(&lock[calling_device]);
+		printk("%s: malformed sleep-wakeup-queue\n",MODNAME);
+        kfree(tmp);
+		return -1;
+	}
+
+    while(aux->next != &(list_r[calling_device].tail)){
+
+		if(aux->next->already_hit == NO){
+			aux->next->awake = YES;
+			aux->next->already_hit = YES;
+			wake_up_process(aux->next->task);
+			break;
+		}
+
+		aux = aux->next;
+
+	}
+    spin_unlock(&lock[calling_device]);
     kfree(tmp);
-
-    wake_up(&wait_queues[calling_device]);
 
 
    return len;
 }
-
 
 static ssize_t ms_read(struct file * filp , char * buff , size_t  len , loff_t * off){
     int current_device,res;
     segment * old_head;
     char * ker_buf;
     current_device=CURRENT_DEVICE;
+    volatile elem me;
+	elem *aux;
+	DECLARE_WAIT_QUEUE_HEAD(the_queue);
+
+	me.next = NULL;
+	me.prev = NULL;
+	me.task = current;
+	me.pid  = current->pid;
+	me.awake = NO;
+	me.already_hit = NO;
+
     DEBUG
         printk("%s: somebody called a read  on mail slot  dev with minor number %d\n",MODNAME,current_device);
+
     if(len > MAX_SEGMENT_SIZE)
         len=MAX_SEGMENT_SIZE;
 
-
-
+    //i'm preparing a temp buffer in order to move the data in a critical section without the risk to go in sleep mode
     ker_buf = kmalloc(len,GFP_KERNEL);
     memset(ker_buf,0,len);
-    DEBUG
-        printk("%s: the read is before the spin lock\n",MODNAME);
     spin_lock(&lock[current_device]);
-    DEBUG
-        printk("%s: the read is after the spin lock\n",MODNAME);
 
-
-
-
-
-    if(head[current_device]==NULL){
+    while(head[current_device]==NULL){
         if (blk_mode[current_device] == NON_BLOCKING_MODE){
             spin_unlock(&lock[current_device]);
             kfree(ker_buf);
             return -EAGAIN;
         }
         else{
+
+            //the reader has to put in the list's tail
+            aux = &(list_r[current_device].tail);
+
+            if(aux->prev == NULL){
+                spin_unlock(&lock[current_device]);
+                printk("%s: malformed sleep-list - service damaged\n",MODNAME);
+                kfree(ker_buf);
+                return -1;
+            }
+
+            aux->prev->next = &me;
+            me.prev = aux->prev;
+            aux->prev = &me;
+            me.next = aux;
+
+            DEBUG
+                print_q(&(list_r[current_device].head),&(list_r[current_device].tail));
+
             spin_unlock(&lock[current_device]);
-            printk("%s : the process with pid = %d is going to sleep\n",MODNAME,current->pid);
-            res = wait_event_interruptible(wait_queues[current_device],head[current_device]!=NULL);
+            DEBUG
+                printk("%s : the process with pid = %d is going to sleep\n",MODNAME,current->pid);
+
+            res = wait_event_interruptible(the_queue,head[current_device]!=NULL);
+
             if(res!=0){
                 printk("%s:the process with pid %d has been awaked by a signal\n",MODNAME,current->pid);
                 kfree(ker_buf);
                 return -ERESTARTSYS;
             }
-            else{
-                printk("%s: res is %d\n",MODNAME,res);
-                spin_lock(&lock[current_device]);
+
+            printk("%s: res is %d\n",MODNAME,res);
+            spin_lock(&lock[current_device]);
+            //the reader has to delete in the list
+            aux = &(list_r[current_device].head);
+
+            if(aux == NULL){
+                spin_unlock(&lock[current_device]);
+                printk("%s: malformed sleep-list upon wakeup - service damaged\n",MODNAME);
+                kfree(ker_buf);
+                return -1;
             }
+
+            me.prev->next = me.next;//we know where we are thanks to double linkage
+            me.next->prev = me.prev;
+
+            DEBUG
+                print_q(&(list_r[current_device].head),&(list_r[current_device].tail));
+
         }
     }
-        printk("%s : len = %du and size = %du\n",MODNAME,len,head[current_device]->size);
-    //se sono qui è perchè o c'era gia da leggere o ho dormito e ora c'è :)
+    printk("%s : len = %du and size = %du\n",MODNAME,len,head[current_device]->size);
+
     if(len <  head[current_device]->size){
         DEBUG
             printk("%s: someone is trying to read an amount of data less than head segment size \n",MODNAME);
-            spin_unlock(&lock[current_device]);
-            kfree(ker_buf);
-            return -EINVAL;
 
+        spin_unlock(&lock[current_device]);
+        kfree(ker_buf);
+        return -EINVAL;
 
     }
 
@@ -374,13 +511,37 @@ static ssize_t ms_read(struct file * filp , char * buff , size_t  len , loff_t *
         old_head = head[current_device];
         memcpy(ker_buf, head[current_device]->payload,len);
         used[current_device]-=len;
+
         if(tail[current_device] == head[current_device])
             tail[current_device] = NULL;
         head[current_device] = head[current_device]->next;
+
+        //the reader has to awake a writer in the list
+        aux = &(list_w[current_device].head);
+
+        if(aux == NULL){
+            spin_unlock(&lock[current_device]);
+            printk("%s: malformed sleep-list\n",MODNAME);
+            kfree(ker_buf);
+            return -1;
+        }
+
+        while(aux->next != &(list_w[current_device].tail)){
+
+            if(aux->next->already_hit == NO){
+                aux->next->awake = YES;
+                aux->next->already_hit = YES;
+                wake_up_process(aux->next->task);
+                break;
+            }
+
+            aux = aux->next;
+
+        }
+
         spin_unlock(&lock[current_device]);
-        wake_up(&wait_queues[current_device]);
-        copy_to_user(buff,ker_buf,len);
-        //spin_unlock(&lock[current_device]);
+
+        copy_to_user(buff,ker_buf,len); //here i might go to sleep but i'm not in critical section
         kfree(old_head->payload);
         kfree(old_head);
         kfree(ker_buf);
@@ -395,7 +556,7 @@ static ssize_t ms_read(struct file * filp , char * buff , size_t  len , loff_t *
 
 static void purge(int current_device){
     segment* dead_list = NULL;
-    segment* last = NULL; //ULTIMA DA CANCELLARE
+    segment* last = NULL; //the last segment that have to delete
     segment* to_die = NULL;
     int done = 0;
     while(used[current_device] > actual_maximum_size[current_device]){
@@ -411,8 +572,10 @@ static void purge(int current_device){
     spin_unlock(&lock[current_device]);
 
     while(dead_list !=NULL && !done){
+
         if(dead_list ==last)
             done=1;
+
         to_die = dead_list;
         dead_list = dead_list->next;
         kfree(to_die->payload);
@@ -420,9 +583,32 @@ static void purge(int current_device){
     }
 }
 
+static void print_q(elem * head,elem * tail){
+    elem * aux = head;
+
+    while(aux->next != tail){
+        printk("%s: there is a process with pid = %d\n",MODNAME,aux->next->task->pid);
+        aux=aux->next;
+    }
+}
+
+static void awake_until(int additional, elem * head , elem * tail ){
+    elem * aux = head;
+    while(aux->next != tail && additional != 0){
+		if(aux->next->already_hit == NO && aux->next->len <= additional ){
+			aux->next->awake = YES;
+			aux->next->already_hit = YES;
+			wake_up_process(aux->next->task);
+			additional-=aux->next->len;
+		}
+        aux=aux->next;
+    }
+}
+
 
 
 static struct file_operations fops = {
+  .owner = THIS_MODULE,
   .write = ms_write,
   .open =  ms_open,
   .release = ms_release,
@@ -451,7 +637,14 @@ int init_module(void)
         actual_purge_option[i]=NO_PURGE;
         blk_mode[i]=BLOCKING_MODE;
         spin_lock_init(&lock[i]);
-        init_waitqueue_head(&wait_queues[i]);
+        list_r[i].head=my_head;
+        list_r[i].tail=my_tail;
+        list_r[i].head.next=&list_r[i].tail;
+        list_r[i].tail.prev=&list_r[i].head;
+        list_w[i].head=my_head;
+        list_w[i].tail=my_tail;
+        list_w[i].head.next=&list_w[i].tail;
+        list_w[i].tail.prev=&list_w[i].head;
     }
 
 	return 0;
@@ -459,6 +652,7 @@ int init_module(void)
 
 void cleanup_module(void)
 {
+
     int i;
     for(i=0;i<MAX_MINOR_NUM;i++){
         while(head[i]!=NULL){
